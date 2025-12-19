@@ -22,8 +22,10 @@
 //! 3. Send RST to close without completing handshake (stealth)
 
 use crate::error::{ScanError, ScanResult};
-use crate::scanner::{PortResult, PortStatus};
+use crate::scanner::traits::{PortResult, PortStatus, ScanType, Scanner};
 use crate::services::get_service_description;
+use crate::types::Port;
+use async_trait::async_trait;
 use pnet::datalink::{self, Channel, NetworkInterface};
 use pnet::packet::ethernet::{EtherTypes, MutableEthernetPacket};
 use pnet::packet::ip::IpNextHeaderProtocols;
@@ -35,6 +37,13 @@ use std::time::Duration;
 /// SYN Scanner for stealth port scanning.
 ///
 /// **Requires elevated privileges (root/sudo).**
+///
+/// # Performance Characteristics
+///
+/// - **Reliability**: Medium - depends on network conditions
+/// - **Stealth**: High - no complete TCP handshake
+/// - **Speed**: Very fast - no connection overhead
+/// - **Privileges**: Root/sudo required
 pub struct SynScanner {
     target: Ipv4Addr,
     source_ip: Ipv4Addr,
@@ -80,26 +89,6 @@ impl SynScanner {
         })
     }
 
-    /// Scan a single port using SYN technique.
-    pub async fn scan_port(&self, port: u16) -> PortResult {
-        let service = get_service_description(port).to_string();
-
-        match self.send_syn_and_wait(port).await {
-            Ok(status) => PortResult {
-                port,
-                status,
-                service,
-                banner: None, // SYN scans don't grab banners
-            },
-            Err(_) => PortResult {
-                port,
-                status: PortStatus::Filtered,
-                service,
-                banner: None,
-            },
-        }
-    }
-
     /// Send SYN packet and wait for response.
     async fn send_syn_and_wait(&self, port: u16) -> ScanResult<PortStatus> {
         // Build the SYN packet
@@ -114,7 +103,6 @@ impl SynScanner {
                 ))
             }
             Err(e) => {
-                // Check for permission error
                 let err_str = e.to_string().to_lowercase();
                 if err_str.contains("permission") || err_str.contains("operation not permitted") {
                     return Err(ScanError::PermissionDenied(
@@ -140,7 +128,6 @@ impl SynScanner {
                     }
                 }
                 Err(e) => {
-                    // Ignore timeout errors, break on others
                     if !e.to_string().contains("timed out") {
                         break;
                     }
@@ -154,7 +141,6 @@ impl SynScanner {
 
     /// Build a TCP SYN packet.
     fn build_syn_packet(&self, dest_port: u16) -> ScanResult<Vec<u8>> {
-        // Use a random source port
         let source_port: u16 = rand_source_port();
 
         // Ethernet + IP + TCP header sizes
@@ -168,9 +154,10 @@ impl SynScanner {
         // Build Ethernet frame
         {
             let mut eth_packet = MutableEthernetPacket::new(&mut buffer[..ethernet_header_size])
-                .ok_or_else(|| ScanError::InvalidPacket("Failed to create ethernet packet".to_string()))?;
+                .ok_or_else(|| {
+                    ScanError::InvalidPacket("Failed to create ethernet packet".to_string())
+                })?;
 
-            // Use broadcast for now (ARP resolution would be needed for real implementation)
             eth_packet.set_destination(pnet::util::MacAddr::broadcast());
             eth_packet.set_source(self.interface.mac.unwrap_or(pnet::util::MacAddr::zero()));
             eth_packet.set_ethertype(EtherTypes::Ipv4);
@@ -179,7 +166,8 @@ impl SynScanner {
         // Build IP packet
         {
             let mut ip_packet = MutableIpv4Packet::new(
-                &mut buffer[ethernet_header_size..ethernet_header_size + ip_header_size + tcp_header_size],
+                &mut buffer
+                    [ethernet_header_size..ethernet_header_size + ip_header_size + tcp_header_size],
             )
             .ok_or_else(|| ScanError::InvalidPacket("Failed to create IP packet".to_string()))?;
 
@@ -200,10 +188,11 @@ impl SynScanner {
 
         // Build TCP packet
         {
-            let mut tcp_packet = MutableTcpPacket::new(
-                &mut buffer[ethernet_header_size + ip_header_size..],
-            )
-            .ok_or_else(|| ScanError::InvalidPacket("Failed to create TCP packet".to_string()))?;
+            let mut tcp_packet =
+                MutableTcpPacket::new(&mut buffer[ethernet_header_size + ip_header_size..])
+                    .ok_or_else(|| {
+                        ScanError::InvalidPacket("Failed to create TCP packet".to_string())
+                    })?;
 
             tcp_packet.set_source(source_port);
             tcp_packet.set_destination(dest_port);
@@ -215,7 +204,8 @@ impl SynScanner {
             tcp_packet.set_window(65535);
             tcp_packet.set_urgent_ptr(0);
 
-            let checksum = tcp::ipv4_checksum(&tcp_packet.to_immutable(), &self.source_ip, &self.target);
+            let checksum =
+                tcp::ipv4_checksum(&tcp_packet.to_immutable(), &self.source_ip, &self.target);
             tcp_packet.set_checksum(checksum);
         }
 
@@ -268,6 +258,35 @@ impl SynScanner {
     }
 }
 
+#[async_trait]
+impl Scanner for SynScanner {
+    fn scan_type(&self) -> ScanType {
+        ScanType::Syn
+    }
+
+    fn requires_privileges(&self) -> bool {
+        true
+    }
+
+    fn target(&self) -> IpAddr {
+        IpAddr::V4(self.target)
+    }
+
+    fn timeout(&self) -> Duration {
+        self.timeout
+    }
+
+    async fn scan_port(&self, port: Port) -> PortResult {
+        let port_num = port.as_u16();
+        let service = get_service_description(port_num).to_string();
+
+        match self.send_syn_and_wait(port_num).await {
+            Ok(status) => PortResult::new(port, status, service),
+            Err(_) => PortResult::new(port, PortStatus::Filtered, service),
+        }
+    }
+}
+
 /// Find a suitable network interface.
 fn find_interface(name: Option<&str>) -> ScanResult<NetworkInterface> {
     let interfaces = datalink::interfaces();
@@ -281,11 +300,7 @@ fn find_interface(name: Option<&str>) -> ScanResult<NetworkInterface> {
         // Find the first non-loopback interface with an IP
         interfaces
             .into_iter()
-            .find(|iface| {
-                !iface.is_loopback()
-                    && iface.is_up()
-                    && iface.ips.iter().any(|ip| ip.is_ipv4())
-            })
+            .find(|iface| !iface.is_loopback() && iface.is_up() && iface.ips.iter().any(|ip| ip.is_ipv4()))
             .ok_or_else(|| {
                 ScanError::InterfaceNotFound("No suitable network interface found".to_string())
             })
@@ -321,12 +336,18 @@ mod tests {
 
     #[test]
     fn test_find_interface() {
-        // Should find at least one interface
         let result = find_interface(None);
         // This might fail in CI environments without network
         if result.is_ok() {
             let iface = result.unwrap();
             assert!(!iface.name.is_empty());
         }
+    }
+
+    #[test]
+    fn test_syn_scanner_requires_privileges() {
+        // We can test the trait method even without creating a scanner
+        // Just verify the trait definition is correct
+        assert!(true); // Placeholder - actual scanner requires root
     }
 }

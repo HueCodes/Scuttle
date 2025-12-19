@@ -15,8 +15,10 @@
 //! Root/sudo privileges are required to receive ICMP messages.
 
 use crate::error::{ScanError, ScanResult};
-use crate::scanner::{PortResult, PortStatus};
+use crate::scanner::traits::{PortResult, PortStatus, ScanType, Scanner};
 use crate::services::get_service_description;
+use crate::types::Port;
+use async_trait::async_trait;
 use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
 use tokio::net::UdpSocket;
@@ -61,6 +63,13 @@ const UDP_PROBES: &[UdpProbe] = &[
 const DEFAULT_PROBE: &[u8] = b"\x00";
 
 /// UDP Scanner for detecting open UDP ports.
+///
+/// # Performance Characteristics
+///
+/// - **Reliability**: Low - UDP is connectionless
+/// - **Stealth**: Medium - may be logged by firewalls
+/// - **Speed**: Slow - requires waiting for timeouts
+/// - **Privileges**: Root for ICMP detection
 pub struct UdpScanner {
     target: IpAddr,
     timeout: Duration,
@@ -81,23 +90,6 @@ impl UdpScanner {
         }
     }
 
-    /// Scan a single UDP port.
-    pub async fn scan_port(&self, port: u16) -> PortResult {
-        let service = get_service_description(port).to_string();
-
-        let status = match self.probe_port(port).await {
-            Ok(status) => status,
-            Err(_) => PortStatus::Filtered,
-        };
-
-        PortResult {
-            port,
-            status,
-            service,
-            banner: None, // UDP doesn't support banner grabbing in this implementation
-        }
-    }
-
     /// Send probe and wait for response.
     async fn probe_port(&self, port: u16) -> ScanResult<PortStatus> {
         let addr = SocketAddr::new(self.target, port);
@@ -111,21 +103,27 @@ impl UdpScanner {
 
         let socket = UdpSocket::bind(local_addr)
             .await
-            .map_err(|e| ScanError::ConnectionFailed(e.to_string()))?;
+            .map_err(|e| ScanError::ConnectionFailed {
+                target: self.target.to_string(),
+                port,
+                reason: e.to_string(),
+            })?;
 
-        socket
-            .connect(addr)
-            .await
-            .map_err(|e| ScanError::ConnectionFailed(e.to_string()))?;
+        socket.connect(addr).await.map_err(|e| ScanError::ConnectionFailed {
+            target: self.target.to_string(),
+            port,
+            reason: e.to_string(),
+        })?;
 
         let probe = get_probe_for_port(port);
 
         for attempt in 0..self.retries {
             // Send probe
-            socket
-                .send(probe)
-                .await
-                .map_err(|e| ScanError::ConnectionFailed(e.to_string()))?;
+            socket.send(probe).await.map_err(|e| ScanError::ConnectionFailed {
+                target: self.target.to_string(),
+                port,
+                reason: e.to_string(),
+            })?;
 
             // Wait for response
             let mut buf = [0u8; 1024];
@@ -155,8 +153,38 @@ impl UdpScanner {
         }
 
         // No response after retries - open|filtered
-        // We report as Open because many UDP services don't respond to probes
         Ok(PortStatus::OpenFiltered)
+    }
+}
+
+#[async_trait]
+impl Scanner for UdpScanner {
+    fn scan_type(&self) -> ScanType {
+        ScanType::Udp
+    }
+
+    fn requires_privileges(&self) -> bool {
+        true // For ICMP detection
+    }
+
+    fn target(&self) -> IpAddr {
+        self.target
+    }
+
+    fn timeout(&self) -> Duration {
+        self.timeout
+    }
+
+    async fn scan_port(&self, port: Port) -> PortResult {
+        let port_num = port.as_u16();
+        let service = get_service_description(port_num).to_string();
+
+        let status = match self.probe_port(port_num).await {
+            Ok(status) => status,
+            Err(_) => PortStatus::Filtered,
+        };
+
+        PortResult::new(port, status, service)
     }
 }
 
@@ -180,9 +208,11 @@ mod tests {
         assert_eq!(get_probe_for_port(12345), DEFAULT_PROBE); // Unknown port
     }
 
-    #[tokio::test]
-    async fn test_scanner_creation() {
+    #[test]
+    fn test_scanner_creation() {
         let scanner = UdpScanner::new(IpAddr::V4(Ipv4Addr::LOCALHOST), Duration::from_secs(1));
         assert_eq!(scanner.target, IpAddr::V4(Ipv4Addr::LOCALHOST));
+        assert!(scanner.requires_privileges());
+        assert_eq!(scanner.scan_type(), ScanType::Udp);
     }
 }
