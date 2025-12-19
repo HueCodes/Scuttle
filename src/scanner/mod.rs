@@ -3,102 +3,108 @@
 //! This module provides a unified interface for TCP, SYN, and UDP scanning,
 //! managing concurrent scanning tasks using the tokio runtime.
 
+pub mod rate_limiter;
 pub mod syn;
 pub mod tcp;
+pub mod traits;
 pub mod udp;
 
-use crate::cli::ScanType;
-use crate::error::ScanResult;
-use futures::stream::{self, StreamExt};
-use indicatif::{ProgressBar, ProgressStyle};
-use serde::Serialize;
-use std::net::IpAddr;
-use std::sync::Arc;
-use std::time::{Duration, Instant};
-use tokio::sync::Semaphore;
-
+pub use rate_limiter::RateLimiter;
 pub use syn::SynScanner;
 pub use tcp::TcpConnectScanner;
+pub use traits::{PortResult, PortStatus, ScanConfig, ScanType, Scanner};
 pub use udp::UdpScanner;
 
-/// Status of a scanned port.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "lowercase")]
-pub enum PortStatus {
-    /// Port is open (service listening)
-    Open,
-    /// Port is closed (no service, RST received)
-    Closed,
-    /// Port is filtered (no response, possibly by firewall)
-    Filtered,
-    /// Port is either open or filtered (UDP-specific)
-    #[serde(rename = "open|filtered")]
-    OpenFiltered,
+use crate::error::ScanResult;
+use crate::storage::ScanRecord;
+use crate::types::Port;
+use futures::stream::{self, StreamExt};
+use indicatif::{ProgressBar, ProgressStyle};
+use std::sync::Arc;
+use std::time::Instant;
+use tokio::sync::Semaphore;
+
+/// Configuration for a complete scan job.
+#[derive(Debug, Clone)]
+pub struct ScanJobConfig {
+    /// Ports to scan.
+    pub ports: Vec<Port>,
+    /// Maximum concurrent connections.
+    pub concurrency: usize,
+    /// Show verbose output with progress bar.
+    pub verbose: bool,
+    /// Include closed ports in results.
+    pub show_closed: bool,
+    /// Rate limit in packets per second (0 = unlimited).
+    pub rate_limit: u32,
 }
 
-impl std::fmt::Display for PortStatus {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            PortStatus::Open => write!(f, "open"),
-            PortStatus::Closed => write!(f, "closed"),
-            PortStatus::Filtered => write!(f, "filtered"),
-            PortStatus::OpenFiltered => write!(f, "open|filtered"),
+impl Default for ScanJobConfig {
+    fn default() -> Self {
+        Self {
+            ports: Vec::new(),
+            concurrency: 500,
+            verbose: false,
+            show_closed: false,
+            rate_limit: 0,
         }
     }
 }
 
-/// Result of scanning a single port.
-#[derive(Debug, Clone, Serialize)]
-pub struct PortResult {
-    pub port: u16,
-    pub status: PortStatus,
-    pub service: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub banner: Option<String>,
+impl ScanJobConfig {
+    /// Create a new job config with the given ports.
+    pub fn new(ports: Vec<Port>) -> Self {
+        Self {
+            ports,
+            ..Default::default()
+        }
+    }
+
+    /// Set concurrency level.
+    pub fn with_concurrency(mut self, concurrency: usize) -> Self {
+        self.concurrency = concurrency;
+        self
+    }
+
+    /// Enable verbose mode.
+    pub fn with_verbose(mut self) -> Self {
+        self.verbose = true;
+        self
+    }
+
+    /// Show closed ports.
+    pub fn with_closed(mut self) -> Self {
+        self.show_closed = true;
+        self
+    }
+
+    /// Set rate limit.
+    pub fn with_rate_limit(mut self, rate: u32) -> Self {
+        self.rate_limit = rate;
+        self
+    }
 }
 
-/// Complete scan results.
-#[derive(Debug, Clone, Serialize)]
-pub struct ScanResults {
-    pub target: String,
-    pub ip_address: String,
-    pub scan_type: String,
-    pub ports_scanned: usize,
-    pub open_ports: usize,
-    pub closed_ports: usize,
-    pub filtered_ports: usize,
-    pub duration_ms: u64,
-    pub results: Vec<PortResult>,
-}
-
-/// Configuration for a scan.
-pub struct ScanConfig {
-    pub target: IpAddr,
-    pub target_hostname: String,
-    pub ports: Vec<u16>,
-    pub scan_type: ScanType,
-    pub concurrency: usize,
-    pub timeout: Duration,
-    pub grab_banners: bool,
-    pub show_closed: bool,
-    pub verbose: bool,
-    pub interface: Option<String>,
-}
-
-/// Execute a complete port scan.
-pub async fn run_scan(config: ScanConfig) -> ScanResult<ScanResults> {
+/// Execute a complete port scan using the provided scanner.
+pub async fn run_scan(
+    scanner: Arc<dyn Scanner>,
+    config: ScanJobConfig,
+) -> ScanResult<ScanRecord> {
     let start_time = Instant::now();
     let total_ports = config.ports.len();
+    let scan_type = scanner.scan_type();
+    let target = scanner.target();
 
     // Set up progress bar
     let progress = if config.verbose {
         let pb = ProgressBar::new(total_ports as u64);
         pb.set_style(
             ProgressStyle::default_bar()
-                .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({percent}%) {msg}")
+                .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({percent}%) | {msg}")
                 .unwrap()
                 .progress_chars("=>-"),
         );
+        pb.set_message("Starting scan...");
         Some(pb)
     } else {
         None
@@ -107,65 +113,52 @@ pub async fn run_scan(config: ScanConfig) -> ScanResult<ScanResults> {
     // Create semaphore for bounded concurrency
     let semaphore = Arc::new(Semaphore::new(config.concurrency));
 
-    let results: Vec<PortResult> = match config.scan_type {
-        ScanType::Connect => {
-            let scanner = Arc::new(TcpConnectScanner::new(
-                config.target,
-                config.timeout,
-                config.grab_banners,
-            ));
-
-            scan_with_scanner(
-                config.ports,
-                semaphore,
-                progress.as_ref(),
-                move |port| {
-                    let scanner = Arc::clone(&scanner);
-                    async move { scanner.scan_port(port).await }
-                },
-            )
-            .await
-        }
-        ScanType::Syn => {
-            let scanner = Arc::new(
-                SynScanner::new(config.target, config.interface.as_deref(), config.timeout)
-                    .map_err(|e| {
-                        eprintln!("\nSYN scan error: {}", e);
-                        eprintln!("Hint: SYN scanning requires root/sudo privileges.");
-                        eprintln!("Try: sudo scuttle {} -s syn", config.target_hostname);
-                        e
-                    })?,
-            );
-
-            scan_with_scanner(
-                config.ports,
-                semaphore,
-                progress.as_ref(),
-                move |port| {
-                    let scanner = Arc::clone(&scanner);
-                    async move { scanner.scan_port(port).await }
-                },
-            )
-            .await
-        }
-        ScanType::Udp => {
-            let scanner = Arc::new(UdpScanner::new(config.target, config.timeout));
-
-            scan_with_scanner(
-                config.ports,
-                semaphore,
-                progress.as_ref(),
-                move |port| {
-                    let scanner = Arc::clone(&scanner);
-                    async move { scanner.scan_port(port).await }
-                },
-            )
-            .await
-        }
+    // Create rate limiter if needed
+    let rate_limiter = if config.rate_limit > 0 {
+        Some(Arc::new(RateLimiter::new(config.rate_limit)))
+    } else {
+        None
     };
 
+    // Execute concurrent scans
+    let results: Vec<PortResult> = stream::iter(config.ports.clone())
+        .map(|port| {
+            let sem = Arc::clone(&semaphore);
+            let scanner = Arc::clone(&scanner);
+            let limiter = rate_limiter.clone();
+            let progress = progress.clone();
+
+            async move {
+                // Acquire semaphore permit for concurrency control
+                let _permit = sem.acquire().await.unwrap();
+
+                // Apply rate limiting if configured
+                if let Some(ref limiter) = limiter {
+                    limiter.wait().await;
+                }
+
+                let result = scanner.scan_port(port).await;
+
+                // Update progress bar
+                if let Some(ref pb) = progress {
+                    pb.inc(1);
+                    if result.status == PortStatus::Open {
+                        pb.set_message(format!("Found: {}/tcp open", port));
+                    }
+                }
+
+                result
+            }
+        })
+        .buffer_unordered(config.concurrency.min(1000))
+        .collect()
+        .await;
+
     if let Some(pb) = progress {
-        pb.finish_with_message("Scan complete");
+        pb.finish_with_message(format!(
+            "Scan complete - {} open ports found",
+            results.iter().filter(|r| r.is_open()).count()
+        ));
     }
 
     // Filter and sort results
@@ -179,72 +172,36 @@ pub async fn run_scan(config: ScanConfig) -> ScanResult<ScanResults> {
     };
     filtered_results.sort_by_key(|r| r.port);
 
-    // Count statistics
-    let open_count = filtered_results
-        .iter()
-        .filter(|r| r.status == PortStatus::Open || r.status == PortStatus::OpenFiltered)
-        .count();
-    let closed_count = filtered_results
-        .iter()
-        .filter(|r| r.status == PortStatus::Closed)
-        .count();
-    let filtered_count = filtered_results
-        .iter()
-        .filter(|r| r.status == PortStatus::Filtered)
-        .count();
-
     let duration = start_time.elapsed();
 
-    Ok(ScanResults {
-        target: config.target_hostname,
-        ip_address: config.target.to_string(),
-        scan_type: config.scan_type.to_string(),
-        ports_scanned: total_ports,
-        open_ports: open_count,
-        closed_ports: closed_count,
-        filtered_ports: filtered_count,
-        duration_ms: duration.as_millis() as u64,
-        results: filtered_results,
-    })
+    // Create scan record
+    let record = ScanRecord::new(target.to_string(), target.to_string(), scan_type)
+        .finalize(filtered_results, duration.as_millis() as u64);
+
+    Ok(record)
 }
 
-/// Generic scan executor with bounded concurrency.
-async fn scan_with_scanner<F, Fut>(
-    ports: Vec<u16>,
-    semaphore: Arc<Semaphore>,
-    progress: Option<&ProgressBar>,
-    scanner_fn: F,
-) -> Vec<PortResult>
-where
-    F: Fn(u16) -> Fut + Send + Sync + Clone + 'static,
-    Fut: std::future::Future<Output = PortResult> + Send,
-{
-    stream::iter(ports)
-        .map(|port| {
-            let sem = Arc::clone(&semaphore);
-            let scanner = scanner_fn.clone();
-            let progress = progress.cloned();
-
-            async move {
-                // Acquire semaphore permit
-                let _permit = sem.acquire().await.unwrap();
-
-                let result = scanner(port).await;
-
-                // Update progress
-                if let Some(ref pb) = progress {
-                    pb.inc(1);
-                    if result.status == PortStatus::Open {
-                        pb.set_message(format!("Found open port: {}", port));
-                    }
-                }
-
-                result
-            }
-        })
-        .buffer_unordered(1000) // Allow high buffering, semaphore controls actual concurrency
-        .collect()
-        .await
+/// Create a scanner based on scan type and configuration.
+pub fn create_scanner(
+    scan_type: ScanType,
+    config: ScanConfig,
+) -> ScanResult<Arc<dyn Scanner>> {
+    match scan_type {
+        ScanType::Connect => Ok(Arc::new(TcpConnectScanner::new(
+            config.target,
+            config.timeout,
+            config.grab_banners,
+        ))),
+        ScanType::Syn => {
+            let scanner = SynScanner::new(
+                config.target,
+                config.interface.as_deref(),
+                config.timeout,
+            )?;
+            Ok(Arc::new(scanner))
+        }
+        ScanType::Udp => Ok(Arc::new(UdpScanner::new(config.target, config.timeout))),
+    }
 }
 
 #[cfg(test)]
@@ -252,9 +209,27 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_port_status_display() {
-        assert_eq!(PortStatus::Open.to_string(), "open");
-        assert_eq!(PortStatus::Closed.to_string(), "closed");
-        assert_eq!(PortStatus::Filtered.to_string(), "filtered");
+    fn test_scan_job_config() {
+        let config = ScanJobConfig::new(vec![Port::new(80).unwrap(), Port::new(443).unwrap()])
+            .with_concurrency(100)
+            .with_verbose()
+            .with_rate_limit(1000);
+
+        assert_eq!(config.ports.len(), 2);
+        assert_eq!(config.concurrency, 100);
+        assert!(config.verbose);
+        assert_eq!(config.rate_limit, 1000);
+    }
+
+    #[test]
+    fn test_create_scanner() {
+        use std::net::{IpAddr, Ipv4Addr};
+        use std::time::Duration;
+
+        let config = ScanConfig::new(IpAddr::V4(Ipv4Addr::LOCALHOST))
+            .with_timeout(Duration::from_secs(1));
+
+        let scanner = create_scanner(ScanType::Connect, config);
+        assert!(scanner.is_ok());
     }
 }
