@@ -1,15 +1,25 @@
 [package]
 name = "scuttle"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 authors = ["HueCodes <huecodes@proton.me>"]
-description = "A high-performance port scanner written in Rust"
+description = "A high-performance network port scanner written in Rust"
 license = "MIT"
 repository = "https://github.com/HueCodes/Scuttle"
+keywords = ["network", "scanner", "security", "port-scanner", "async"]
+categories = ["command-line-utilities", "network-programming"]
+
+[lib]
+name = "scuttle"
+path = "src/lib.rs"
+
+[[bin]]
+name = "scuttle"
+path = "src/main.rs"
 
 [dependencies]
-# CLI parsing
-clap = { version = "4.5", features = ["derive"] }
+# CLI parsing with derive macros
+clap = { version = "4.5", features = ["derive", "env", "wrap_help"] }
 
 # Error handling
 anyhow = "1.0"
@@ -43,15 +53,37 @@ socket2 = { version = "0.5", features = ["all"] }
 rand = "0.8"
 libc = "0.2"
 
+# XDG-compliant config directories
+directories = "5.0"
+
+# CIDR parsing
+ipnetwork = "0.20"
+
+# Unique ID generation for scan results
+uuid = { version = "1.11", features = ["v4", "serde"] }
+
+# Time handling
+chrono = { version = "0.4", features = ["serde"] }
+
+# Rate limiting
+governor = "0.8"
+
+# Nonzero integers for rate limiting
+nonzero_ext = "0.3"
+
+# Async trait support
+async-trait = "0.1"
+
 [dev-dependencies]
 tokio-test = "0.4"
-
-[[bin]]
-name = "scuttle"
-path = "src/main.rs"
+tempfile = "3.14"
 
 [profile.release]
 opt-level = 3
 lto = true
 codegen-units = 1
 strip = true
+
+[profile.dev]
+opt-level = 0
+debug = true
